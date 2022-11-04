@@ -9,10 +9,6 @@ from joblib import dump, load
 from preprocessing import DATA_PATH, load_metadata
 from fastai.vision.all import *
 
-# Save models
-if not os.path.isdir(DATA_PATH + 'models'):
-	os.mkdir(DATA_PATH + 'models')
-
 def get_folds(N_folds=5):
 
 	'''
@@ -32,14 +28,14 @@ def get_folds(N_folds=5):
 
 	stratifier_valid = IterativeStratification(n_splits=N_folds, order=10)
 	# Have to do this bc random_state does not work
-	if not os.path.exists(DATA_PATH + f'val_indices_{N_folds}_fold.pkl'):
+	if not os.path.exists(DATA_PATH + f'vmodels/al_indices_{N_folds}_fold.pkl'):
 	    val_idcs_all= {}
 	    for fold, (trn_idcs, val_idcs) in tqdm(enumerate(stratifier_valid.split(df_train, df_train[compounds + ['derivatized']]))):
 	        val_idcs_all[fold] = val_idcs
-	    with open(DATA_PATH + f'val_indices_{N_folds}_folds.pkl', 'wb') as f:
+	    with open(DATA_PATH + f'models/val_indices_{N_folds}_folds.pkl', 'wb') as f:
 	        pickle.dump(val_idcs_all, f, protocol=4)
 	else:
-	    with open(DATA_PATH + f'val_indices_{N_folds}_folds.pkl', 'rb') as f:
+	    with open(DATA_PATH + f'models/val_indices_{N_folds}_folds.pkl', 'rb') as f:
 	        val_idcs_all = pickle.load(f)
 	return val_idcs_all
 
@@ -47,9 +43,6 @@ def load_features():
 
 	'''
     Load features for a trained model.
-
-    Parameters
-    ----------
 
     Returns
     -------
@@ -59,29 +52,24 @@ def load_features():
     full_test_features : pandas.DataFrame
         Dataframe containing all features for testing.
 
-    Example
-    -------
-
-    >>> full_train_features, full_test_features = load_features()
-
     '''
 
-	if not os.path.exists(DATA_PATH + 'train_features.parquet'):
+	if not os.path.exists(DATA_PATH + 'features/train_features.parquet'):
 		print('Train features not found.')
 		return
-	if not os.path.exists(DATA_PATH + 'test_features.parquet'):
+	if not os.path.exists(DATA_PATH + 'features/test_features.parquet'):
 		print('Test features not found.')
 		return
 
 	df_all, df_train, compounds = load_metadata()
 
 	# Load data for RF
-	full_train_features = pd.read_parquet(DATA_PATH + 'train_features.parquet')
+	full_train_features = pd.read_parquet(DATA_PATH + 'features/train_features.parquet')
 	full_train_features = full_train_features.set_index(['mass', 'time_bin']).T
 	full_train_features.columns = [str(l) for l in range(full_train_features.shape[1])]
 	full_train_features['derivatized'] = df_train['derivatized'].astype(int).values
 
-	full_test_features = pd.read_parquet(DATA_PATH + 'test_features.parquet')
+	full_test_features = pd.read_parquet(DATA_PATH + 'features/test_features.parquet')
 	full_test_features = full_test_features.set_index(['mass', 'time_bin']).T
 	full_test_features.columns = [str(l) for l in range(full_test_features.shape[1])]
 	full_test_features['derivatized'] = df_all.loc[df_all['split']=='test', 'derivatized'].astype(int).values
@@ -90,16 +78,61 @@ def load_features():
 
 
 def ms_loss(y_true, y_hat, eps=1e-15):
-	'''Competition loss, takes in np arrays'''
+
+	"""
+	Compute the competition loss
+
+	Parameters
+    ----------
+	y_true: np.array
+		True values
+	y_hat: np.array
+		Predictions
+	eps: float
+		Used to clip predictions to avoid log(0)
+
+    Returns
+    -------
+    loss: float
+
+	"""
 	y_hat = y_hat.clip(eps, 1-eps)
 	return - np.mean(y_true*np.log(y_hat) + (1-y_true)*np.log(1-y_hat))
 
 def get_dfs(trn_idcs, val_idcs, kernel=None, cpd=None):
   
-  ''' This function applies dimensionalty reduction and splits the data into training, validation, and testing sets according to the indices that are passed in'''
+	"""
+	This function applies dimensionalty reduction to the features dataframe 
+	and splits the data into training, validation, and testing sets according to the indices that are passed in.
+
+	Parameters
+    ----------
+	trn_idcs: np.array
+		List of training indices
+	val_idcs: np.array
+		List of validation indices
+	kernel: string
+		Kernel to use for dimensionality reduction if any
+	cpd: string
+		Compound to treat as target if training compounds separately
+
+    Returns
+    -------
+    train_x: np.array
+    	Array with training features
+    train_y: np.array
+	    Array with training labels
+    val_x: np.array
+    	Array with validation features
+    val_y: np.array
+    	Array with validation labels
+    tst_x: np.array
+    	Array with test features
+
+	"""
 
   if kernel == 'kpca':
-    krn = KernelPCA(n_components=180, kernel='rbf') # n_components chosen to preserve 95% of the variance (empirically)
+    krn = KernelPCA(n_components=180, kernel='rbf') # n_components chosen to preserve ~95% of the variance (empirically)
   elif kernel == 'pca':
     krn = PCA(n_components=100) # max for TabPFN
 
@@ -130,15 +163,31 @@ def get_dfs(trn_idcs, val_idcs, kernel=None, cpd=None):
   return train_x, train_y, val_x, val_y, tst_x
 
 
-def update_predictions(pth, fold, model, val_preds, tst_preds):
-  '''
-  This function keeps track of the predictions on the val and test sets for each fold and each model to avoid having to re-train all the models at once.
-  Takes in the path to a pickle file containing a dictionnary of val and tst preds by fold and model, add the preds for the current fold and model, and saves.
-  '''
-  if os.path.exists(pth):
+def update_predictions(fold, model, val_preds, tst_preds):
+  
+	"""
+	This function saved the prediction of a given model on the val set for a given fold and on the test set.
+
+	Parameters
+    ----------
+	fold: int
+		Use to index the prediction dictionaries
+	model: str
+		Name of the model
+	val_preds: np.array
+		Predictions on the validation set for a given fold
+	tst_preds: np.array
+		Predictions on the test set
+
+    Returns
+    -------
+
+  """
+  if os.path.exists(DATA_PATH + 'predictions/all_predictions.pkl'):
     # Load
-    with open(pth, 'rb') as f:
+    with open(DATA_PATH + 'predictions/all_predictions.pkl', 'rb') as f:
         dic = pickle.load(f)
+
     y_hats_val_all = dic['val_preds']
     y_hats_pred_all = dic['tst_preds']
     # Update
@@ -154,7 +203,7 @@ def update_predictions(pth, fold, model, val_preds, tst_preds):
     y_hats_pred_all[fold][model] = tst_preds
 
   # Save 
-  with open(pth, 'wb') as f:
+  with open(DATA_PATH + 'predictions/all_predictions.pkl', 'wb') as f:
     pickle.dump({'val_preds': y_hats_val_all, 'tst_preds': y_hats_pred_all}, f)
   
   return
@@ -184,7 +233,7 @@ def accuracy_multi(inp, targ, thresh=0.5, sigmoid=True):
 
 def prep_dls(arch, df_train, val_idcs, size=None, bs=16):
 	
-	'''
+	"""
     Returns a fastai dataloader and learner object for a given architecture. 
     
     Parameters:
@@ -199,7 +248,14 @@ def prep_dls(arch, df_train, val_idcs, size=None, bs=16):
         A tuple with the dimensions of an image input.
     bs: int
         Batch size.
-    '''
+
+    Returns
+    -------
+    learn: fastai vision learner
+    dls: dataloaders
+    df_tst: pd.DataFrame
+    	Dataframe with the path to the validation and test images
+    """
 
     if size:
         dblock = DataBlock(blocks=(ImageBlock, MultiCategoryBlock),
@@ -240,9 +296,19 @@ class VisionModel(object):
 		self.val_idcs_all = val_idcs_all
 		self.val_preds = {}
 		self.tst_preds = {}
-		self.save_path = save_path # pickle file storing predictions
 
 	def train_fold(self, n_epochs=20, fold=0):
+
+		"""
+	    Trains the vision model on the fold.
+	    
+	    Returns
+	    -------
+	    val_preds: pd.DataFrame
+	    	DataFrame with predictions on the fold's validation set
+	    tst_preds: pd.DataFrame
+	    	DataFrame with predictions on the competition's test set
+	    """
 
 		val_idcs = self.val_idcs_all[fold]
 		learn, dls, df_tst = prep_dls(self.arch, self.df_train, val_idcs, size=self.size, bs=self.bs)
@@ -265,11 +331,16 @@ class VisionModel(object):
 
 	def predict_all(self):
 
+		"""
+	    Trains the vision model on all fold and saves predictions on val and test sets.
+	    
+	    """
+
 		for fold in tqdm(self.val_idcs_all.keys()):
     		val_idcs = self.val_idcs_all[fold]
 
     		if not os.path.exists(DATA_PATH + f'models/{self.arch}_{fold}.pth'):
-    			val_preds, tst_preds = train_fold(fold=fold)
+    			val_preds, tst_preds = self.train_fold(fold=fold)
 
     		else:
     			# Load model
@@ -287,14 +358,14 @@ class VisionModel(object):
 			self.tst_preds[fold] = tst_preds
 
 			# Save
-			update_predictions(self.save_path, fold, self.arch, val_preds.values, tst_preds.values)
+			update_predictions(fold, self.arch, val_preds.values, tst_preds.values)
 		return 
 
 ####### Other models #######
 
 class Model(object):
 
-	def __init__(self, name, df_train, val_idcs_all, train_features, test_features):
+	def __init__(self, name, df_train, val_idcs_all, train_features, test_features, save_path):
 
 		self.name = name
 		self.df_train = df_train
@@ -314,11 +385,20 @@ class Model(object):
 		self.test_features = test_features
 		self.val_preds = {}
 		self.tst_preds = {}
+		self.save_path = save_path
 
 
 	def train_fold(self, cpd, fold=0):
 
-		'''Training for one fold and one compound'''
+		"""
+	    Trains the vision model on the fold.
+	    
+	    Returns
+	    -------
+	    val_preds: pd.DataFrame
+	    	DataFrame with predictions on the fold's validation set
+	    tst_preds: pd.DataFrame
+	    """
 
 		# Define indices for this fold
 		val_idcs = self.val_idcs_all[fold]
@@ -369,7 +449,10 @@ class Model(object):
 
 	def predict_all(self):
 
-		''' Training loop on all folds and compounds. Predict val and test and record predictions'''
+		"""
+	    Trains the model on all fold and saves predictions on val and test sets.
+	    
+	    """
 
 		for fold in tqdm(self.val_idcs_all.keys()):
     		val_idcs = self.val_idcs_all[fold]
@@ -380,7 +463,7 @@ class Model(object):
     		for cpd in compounds:
 
 	    		if not os.path.exists(DATA_PATH + f'models/{self.name}_{cpd}_{fold}.joblib'):
-	    			val_pred, tst_pred = train_fold(fold=fold)
+	    			val_pred, tst_pred = self.train_fold(fold=fold)
 
 	    		else:
 	    			# Load model
@@ -421,7 +504,9 @@ class Model(object):
 			self.tst_preds[fold] = tmp_tst_preds
 
 			# Save
-			update_predictions(self.save_path, fold, self.name, tmp_val_preds.values, tmp_tst_preds.values)
+			update_predictions(fold, self.name, tmp_val_preds.values, tmp_tst_preds.values)
+
+		return
 
 
 if __name__ == '__main__':
@@ -432,8 +517,12 @@ if __name__ == '__main__':
 
 	########### RF, XGBoost, and TabPFN training ###########
 	# Initialize a model and call predict_all, this will train it and save the predictions on the val and tst sets
+	rf = Model('RF', df_train, val_idcs_all, full_train_features, full_test_features, SAVE_PATH)
+	xgb = Model('XGBoost', df_train, val_idcs_all, full_train_features, full_test_features, SAVE_PATH)
+	tabpfn = Model('TapPFN', df_train, val_idcs_all, full_train_features, full_test_features, SAVE_PATH)
 
-
+	for model in [rf, xgb, tabpfn]:
+		model.predict_all()
 
 	########### Vision training ###########
 	# List of models to use
@@ -450,5 +539,6 @@ if __name__ == '__main__':
 	    'convnext_small_in22k': None,
 	    'efficientnet_b0': 224
 	}
-
-# Next and last script: ensemble weighting and submission
+	for arch, size in vision_models.items():
+		model = VisionModel(arch, size, df_train, val_idcs_all, SAVE_PATH)
+		mode.predict_all()

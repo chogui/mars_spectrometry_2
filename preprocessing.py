@@ -5,10 +5,28 @@ import pybaselines
 from PIL import Image
 from tqdm import tqdm
 
+# Set data path
 DATA_PATH = 'gcms_data/'
 
 def load_metadata():
-    ''' Load labels and prepare the dataframe with file paths and labels'''
+    
+    """
+    Load labels and prepare the dataframes with file paths and labels
+    
+    Parameters
+    ----------
+    None
+        
+    Returns
+    -------
+    df_all : pandas.DataFrame
+        DataFrame of file paths and labels for training, validation, and test sets.
+    df_train : pandas.DataFrame
+        DataFrame of file paths and labels for training, and validation sets.
+    compounds : list
+        List of coumpound names, sorted alphabetically.
+    """
+
     metadata = pd.read_csv(DATA_PATH + 'metadata.csv')
     metadata['derivatized'] = metadata['derivatized'].fillna(0)
 
@@ -21,18 +39,21 @@ def load_metadata():
     train_labels = pd.read_csv(DATA_PATH + 'train_labels.csv')
     val_labels = pd.read_csv(DATA_PATH + 'val_labels.csv')
 
-    # Sort the columns and put everything together
+    # Sort the columns alphabetically
     train_labels = pd.concat([train_labels[['sample_id']], train_labels.drop(['sample_id'],axis=1).pipe(lambda df: df.reindex(sorted(df.columns), axis=1))], axis=1)
     val_labels = pd.concat([val_labels[['sample_id']], val_labels.drop(['sample_id'],axis=1).pipe(lambda df: df.reindex(sorted(df.columns), axis=1))], axis=1)
 
+    # Merge labels with metadata
     df_all = (metadata
                   .drop(['features_md5_hash'], axis=1)
                   .merge(pd.concat([train_labels, val_labels]), on='sample_id', how='left')
                 )
     df_train = df_all.loc[df_all['split'] != 'test'].copy()
+
+    # Extract list of compounds
     compounds = list(train_labels.drop(['sample_id'], axis=1).columns)
 
-    # Create text-based labels to input into the datablock
+    # Create text-based labels to input into the datablock for vision models
     df_labels = df_train.copy()
     for comp in df_labels.columns:
       df_labels.loc[df_labels[comp] == 1, comp] = comp
@@ -43,7 +64,22 @@ def load_metadata():
     return df_all, df_train, compounds
 
 def get_bins():
-    ''' Prepare dataframes to bin raw data along time and mass axes'''
+
+    """
+    This function generates a series of time bins, which are used to create a dataframe of all possible combinations 
+    of time and mass values.
+
+    Returns
+    -------
+
+    timerange (pd.interval_range): A series of time bins with a frequency of 0.5
+    timerange_224 (pd.interval_range): A series of time bins with a frequency of 0.5 and 224 periods
+    massrange_224 (pd.interval_range): A series of mass bins with a frequency of 1 and 224 periods
+    allcombs_df (pd.DataFrame): A dataframe with all possible combinations of time and mass values
+    allcombs_224_df (pd.DataFrame): A dataframe with all possible combinations of time and mass values
+    
+    """
+
     # Create a series of time bins
     timerange = pd.interval_range(start=0, end=45, freq=0.5)
     timerange_224 = pd.interval_range(start=0, end=45, periods=224)
@@ -61,7 +97,7 @@ def get_bins():
 def generate_features(flpth, image=False, size_224=False):
 
     """
-    Generate features from a raw data file.
+    Generate features from a raw data file (path in the metadata df)
     
     Parameters
     ----------
@@ -78,11 +114,12 @@ def generate_features(flpth, image=False, size_224=False):
         DataFrame of features.
     """
     
-    df_src = pd.read_csv(DATA_PATH + flpth)
+    df_src = pd.read_csv(DATA_PATH + 'raw/' + flpth)
     df = df_src.copy()
     
     # Round mass
     df['mass'] = np.round(df['mass']).astype(int)
+
     # Clip the masses to a reasonable range (also gets rid of He at 4.0)
     df = df.loc[df['mass'].between(12, 350)].reset_index(drop=True)
     df = df.groupby(['time', 'mass'])['intensity'].mean().reset_index()
@@ -103,7 +140,7 @@ def generate_features(flpth, image=False, size_224=False):
         df['mass_bin'] = df['mass']
 
 
-    # Combine with a list of all time bin-m/z value combinations
+    # Combine with a list of all time and m/z combinations
     if size_224:
         df = pd.merge(allcombs_df, df, on=["time_bin", "mass_bin"], how="left")
     else:
@@ -116,6 +153,7 @@ def generate_features(flpth, image=False, size_224=False):
     # Pivot and remove baseline by mass channel
     df_piv = df.pivot(index='time_bin', columns='mass_bin', values='intensity')
 
+    # Filter out the baseline
     df_out = df_piv.copy()
     bkgs = {}
     # Process one mass channel at a time
@@ -135,9 +173,9 @@ def generate_features(flpth, image=False, size_224=False):
     if image:
         im = Image.fromarray((df_out.values*255).astype(np.uint8))
         if size_224:
-            im.save(DATA_PATH + flpth.split('.')[0] + '_224.jpg')
+            im.save(DATA_PATH + 'features/' + flpth.split('.')[0] + '_224.jpg')
         else:
-            im.save(DATA_PATH + flpth.split('.')[0] + '.jpg')
+            im.save(DATA_PATH + 'features/' + flpth.split('.')[0] + '.jpg')
     else:
         df_out = (df_out.reset_index()
                         .melt(id_vars=['time_bin'], var_name='mass_bin', value_name='intensity')
@@ -157,6 +195,9 @@ if __name__ == '__main__':
     train_features_dict = {}
     test_features_dict = {}
 
+    if not os.path.exists(DATA_PATH + 'features'):
+        os.mkdir(DATA_PATH + 'features')
+
     for filepath in tqdm(df_all['features_path'].values):
         # Generate image with rounded mass and binned time
         _ = generate_features(filepath, image=True)
@@ -175,8 +216,9 @@ if __name__ == '__main__':
             test_features_dict[sample_id] = df_out
 
     # Post-process and export table of features
+
     train_features = pd.concat(train_features_dict, names=["sample_id", "dummy_index"]).reset_index(level="dummy_index", drop=True)
-    train_features.T.reset_index().rename(columns=lambda c: str(c)).to_parquet(DATA_PATH + 'train_features.parquet')
+    train_features.T.reset_index().rename(columns=lambda c: str(c)).to_parquet(DATA_PATH + 'features/train_features.parquet')
 
     test_features = pd.concat(test_features_dict, names=["sample_id", "dummy_index"]).reset_index(level="dummy_index", drop=True)
-    test_features.T.reset_index().rename(columns=lambda c: str(c)).to_parquet(DATA_PATH + 'test_features.parquet')
+    test_features.T.reset_index().rename(columns=lambda c: str(c)).to_parquet(DATA_PATH + 'features/test_features.parquet')
