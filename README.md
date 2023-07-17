@@ -1,4 +1,4 @@
-# Mars Spectrometry 2: Gas Chromatography challenge on DrivenDate
+# Mars Spectrometry 2: Gas Chromatography challenge on DrivenData
 
 This presents the implementation of my solution to the challenge (18th place).
 
